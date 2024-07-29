@@ -63,8 +63,9 @@ type Controller struct {
 	// CES requests going to api-server, ensures a single CES will not be proccessed
 	// multiple times concurrently, and if CES is added multiple times before it
 	// can be processed, this will only be processed only once.
-	queue     workqueue.RateLimitingInterface
-	rateLimit rateLimitConfig
+	fastQueue     workqueue.RateLimitingInterface
+	standardQueue workqueue.RateLimitingInterface
+	rateLimit     rateLimitConfig
 
 	enqueuedAt     map[CESName]time.Time
 	enqueuedAtLock lock.Mutex
@@ -72,6 +73,10 @@ type Controller struct {
 	wp *workerpool.WorkerPool
 
 	metrics *Metrics
+
+	defaultCESSyncTime time.Duration
+
+	priorityNamespaces map[string]int
 }
 
 // registerController creates and initializes the CES controller
@@ -102,6 +107,7 @@ func registerController(p params) error {
 		rateLimit:           rateLimitConfig,
 		enqueuedAt:          make(map[CESName]time.Time),
 		metrics:             p.Metrics,
+		defaultCESSyncTime:  DefaultCESSyncTime,
 	}
 
 	p.Lifecycle.Append(cesController)

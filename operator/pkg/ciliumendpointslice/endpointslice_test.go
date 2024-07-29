@@ -5,6 +5,7 @@ package ciliumendpointslice
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -88,7 +89,8 @@ func TestFCFSModeSyncCESsInLocalCache(t *testing.T) {
 		}
 	}
 
-	cesController.queue.ShutDown()
+	cesController.fastQueue.ShutDown()
+	cesController.standardQueue.ShutDown()
 	hive.Stop(tlog, context.Background())
 }
 
@@ -158,6 +160,91 @@ func TestIdentityModeSyncCESsInLocalCache(t *testing.T) {
 		}
 	}
 
-	cesController.queue.ShutDown()
+	cesController.fastQueue.ShutDown()
+	cesController.standardQueue.ShutDown()
+	hive.Stop(tlog, context.Background())
+}
+
+func TestDifferentSpeedQueues(t *testing.T) {
+
+	var r *reconciler
+	var fakeClient k8sClient.FakeClientset
+	m := newCESManagerIdentity(2, log).(*cesManagerIdentity)
+	var ciliumEndpoint resource.Resource[*cilium_v2.CiliumEndpoint]
+	var ciliumEndpointSlice resource.Resource[*cilium_v2a1.CiliumEndpointSlice]
+	var cesMetrics *Metrics
+	hive := hive.New(
+		k8sClient.FakeClientCell,
+		k8s.ResourcesCell,
+		metrics.Metric(NewMetrics),
+		cell.Invoke(func(
+			c *k8sClient.FakeClientset,
+			cep resource.Resource[*cilium_v2.CiliumEndpoint],
+			ces resource.Resource[*cilium_v2a1.CiliumEndpointSlice],
+			metrics *Metrics,
+		) error {
+			fakeClient = *c
+			ciliumEndpoint = cep
+			ciliumEndpointSlice = ces
+			cesMetrics = metrics
+			return nil
+		}),
+	)
+	tlog := hivetest.Logger(t)
+	hive.Start(tlog, context.Background())
+
+	r = newReconciler(context.Background(), fakeClient.CiliumFakeClientset.CiliumV2alpha1(), m, log, ciliumEndpoint, ciliumEndpointSlice, cesMetrics)
+
+	rateLimitConfig, err := getRateLimitConfig(params{Cfg: defaultConfig})
+	assert.NoError(t, err)
+	cesController := &Controller{
+		logger:              log,
+		clientset:           fakeClient.Clientset,
+		ciliumEndpoint:      ciliumEndpoint,
+		ciliumEndpointSlice: ciliumEndpointSlice,
+		reconciler:          r,
+		manager:             m,
+		rateLimit:           rateLimitConfig,
+		enqueuedAt:          make(map[CESName]time.Time),
+		metrics:             cesMetrics,
+		priorityNamespaces:  make(map[string]int),
+		defaultCESSyncTime:  0,
+	}
+	cesController.context, cesController.contextCancel = context.WithCancel(context.Background())
+	cesController.priorityNamespaces["FastNamespace"] = 1
+	cesController.initializeQueue()
+
+	var ns string = "NotSoImportant"
+	for i := 0; i < 10; i++ {
+		if i == 6 {
+			ns = "FastNamespace"
+		}
+		cep1 := tu.CreateManagerEndpoint("cep1", int64(2*i+1))
+		cep2 := tu.CreateManagerEndpoint("cep2", int64(2*i))
+
+		ces := tu.CreateStoreEndpointSlice(fmt.Sprintf("ces-%d", i), ns, []cilium_v2a1.CoreCiliumEndpoint{cep1, cep2})
+
+		cesController.onSliceUpdate(ces)
+		if i < 6 {
+			assert.Equal(t, 0, cesController.fastQueue.Len())
+			assert.Equal(t, i+1, cesController.standardQueue.Len())
+		} else {
+			assert.Equal(t, i-5, cesController.fastQueue.Len())
+			assert.Equal(t, 6, cesController.standardQueue.Len())
+		}
+	}
+	for i := 0; i < 10; i++ {
+		cesController.processNextWorkItem()
+		if i < 4 {
+			assert.Equal(t, 3-i, cesController.fastQueue.Len())
+			assert.Equal(t, 6, cesController.standardQueue.Len())
+		} else {
+			assert.Equal(t, 0, cesController.fastQueue.Len())
+			assert.Equal(t, 9-i, cesController.standardQueue.Len())
+		}
+	}
+
+	cesController.fastQueue.ShutDown()
+	cesController.standardQueue.ShutDown()
 	hive.Stop(tlog, context.Background())
 }
