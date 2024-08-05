@@ -6,6 +6,7 @@ package ciliumendpointslice
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	"github.com/cilium/cilium/pkg/metrics"
+	testutils "go.viam.com/utils/testutils"
 )
 
 func TestFCFSModeSyncCESsInLocalCache(t *testing.T) {
@@ -209,7 +211,9 @@ func TestDifferentSpeedQueues(t *testing.T) {
 		metrics:             cesMetrics,
 		priorityNamespaces:  make(map[string]int),
 		defaultCESSyncTime:  0,
+		condLock:            sync.Mutex{},
 	}
+	cesController.cond = *sync.NewCond(&cesController.condLock)
 	cesController.context, cesController.contextCancel = context.WithCancel(context.Background())
 	cesController.priorityNamespaces["FastNamespace"] = 1
 	cesController.initializeQueue()
@@ -226,21 +230,23 @@ func TestDifferentSpeedQueues(t *testing.T) {
 
 		cesController.onSliceUpdate(ces)
 		if i < 6 {
-			assert.Equal(t, 0, cesController.fastQueue.Len())
-			assert.Equal(t, i+1, cesController.standardQueue.Len())
+			testutils.WaitForAssertion(t, func(t testing.TB) { assert.Equal(t, 0, cesController.fastQueue.Len()) })
+			testutils.WaitForAssertion(t, func(t testing.TB) { assert.Equal(t, i+1, cesController.standardQueue.Len()) })
+
 		} else {
-			assert.Equal(t, i-5, cesController.fastQueue.Len())
-			assert.Equal(t, 6, cesController.standardQueue.Len())
+			testutils.WaitForAssertion(t, func(t testing.TB) { assert.Equal(t, i-5, cesController.fastQueue.Len()) })
+			testutils.WaitForAssertion(t, func(t testing.TB) { assert.Equal(t, 6, cesController.standardQueue.Len()) })
 		}
 	}
+
 	for i := 0; i < 10; i++ {
 		cesController.processNextWorkItem()
 		if i < 4 {
-			assert.Equal(t, 3-i, cesController.fastQueue.Len())
-			assert.Equal(t, 6, cesController.standardQueue.Len())
+			testutils.WaitForAssertion(t, func(t testing.TB) { assert.Equal(t, 3-i, cesController.fastQueue.Len()) })
+			testutils.WaitForAssertion(t, func(t testing.TB) { assert.Equal(t, 6, cesController.standardQueue.Len()) })
 		} else {
-			assert.Equal(t, 0, cesController.fastQueue.Len())
-			assert.Equal(t, 9-i, cesController.standardQueue.Len())
+			testutils.WaitForAssertion(t, func(t testing.TB) { assert.Equal(t, 0, cesController.fastQueue.Len()) })
+			testutils.WaitForAssertion(t, func(t testing.TB) { assert.Equal(t, 9-i, cesController.standardQueue.Len()) })
 		}
 	}
 

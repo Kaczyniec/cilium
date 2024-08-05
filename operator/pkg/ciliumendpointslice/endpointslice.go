@@ -59,11 +59,12 @@ func (c *Controller) initializeQueue() {
 		logfields.WorkQueueBurstLimit:  c.rateLimit.current.Burst,
 		logfields.WorkQueueSyncBackOff: defaultSyncBackOff,
 	}).Info("CES controller workqueue configuration")
+	c.rateLimiter = workqueue.NewItemExponentialFailureRateLimiter(defaultSyncBackOff, maxSyncBackOff)
 	c.fastQueue = workqueue.NewRateLimitingQueueWithConfig(
-		workqueue.NewItemExponentialFailureRateLimiter(defaultSyncBackOff, maxSyncBackOff),
+		c.rateLimiter,
 		workqueue.RateLimitingQueueConfig{Name: "cilium_endpoint_slice"})
 	c.standardQueue = workqueue.NewRateLimitingQueueWithConfig(
-		workqueue.NewItemExponentialFailureRateLimiter(defaultSyncBackOff, maxSyncBackOff),
+		c.rateLimiter,
 		workqueue.RateLimitingQueueConfig{Name: "cilium_endpoint_slice"})
 }
 
@@ -71,33 +72,48 @@ func (c *Controller) onEndpointUpdate(cep *cilium_api_v2.CiliumEndpoint) {
 	if cep.Status.Networking == nil || cep.Status.Identity == nil || cep.GetName() == "" || cep.Namespace == "" {
 		return
 	}
+	c.logger.Infof("on CEP update %s, %s", cep.Name, cep.Namespace)
 	touchedCESs := c.manager.UpdateCEPMapping(k8s.ConvertCEPToCoreCEP(cep), cep.Namespace)
 	c.enqueueCESReconciliation(touchedCESs)
 }
 
 func (c *Controller) onEndpointDelete(cep *cilium_api_v2.CiliumEndpoint) {
+	c.logger.Infof("on CEP delete %s, %s", cep.Name, cep.Namespace)
 	touchedCES := c.manager.RemoveCEPMapping(k8s.ConvertCEPToCoreCEP(cep), cep.Namespace)
 	c.enqueueCESReconciliation([]CESName{touchedCES})
 }
 
 func (c *Controller) onSliceUpdate(ces *capi_v2a1.CiliumEndpointSlice) {
+	c.logger.Infof("on CES update %s, %s", ces.Name, ces.Namespace)
 	c.enqueueCESReconciliation([]CESName{NewCESNameNamespace(ces.Name, ces.Namespace)})
 }
 
 func (c *Controller) onSliceDelete(ces *capi_v2a1.CiliumEndpointSlice) {
+	c.logger.Infof("on CES delete %s, %s", ces.Name, ces.Namespace)
 	c.enqueueCESReconciliation([]CESName{NewCESNameNamespace(ces.Name, ces.Namespace)})
 }
 
 func (c *Controller) addToQueue(ces CESName) {
-	if ces.Namespace != "" {
-		_, ok := c.priorityNamespaces[ces.Namespace]
-		if ok {
-			c.fastQueue.AddAfter(ces, c.defaultCESSyncTime)
-		} else {
-			c.standardQueue.AddAfter(ces, c.defaultCESSyncTime)
-		}
-	}
+	_, ok := c.priorityNamespaces[ces.Namespace]
 
+	if ok {
+		time.AfterFunc(c.defaultCESSyncTime, func() {
+			c.logger.Infof("CES %s, %s added to the fast queue after %d", ces.Name, ces.Namespace, c.defaultCESSyncTime)
+			c.fastQueue.Add(ces)
+			c.cond.Signal()
+		})
+		//c.fastQueue.AddAfter(ces, c.defaultCESSyncTime)
+
+	} else {
+		time.AfterFunc(c.defaultCESSyncTime, func() {
+			c.logger.Infof("CES %s, %s added to the stadard queue after %d", ces.Name, ces.Namespace, c.defaultCESSyncTime)
+			c.standardQueue.Add(ces)
+			c.cond.Signal()
+		})
+		//c.standardQueue.AddAfter(ces, c.defaultCESSyncTime)
+
+	}
+	//time.AfterFunc(c.defaultCESSyncTime, c.cond.Signal)
 }
 
 func (c *Controller) enqueueCESReconciliation(cess []CESName) {
@@ -111,7 +127,6 @@ func (c *Controller) enqueueCESReconciliation(cess []CESName) {
 				c.enqueuedAt[ces] = time.Now()
 			}
 			c.enqueuedAtLock.Unlock()
-
 			c.addToQueue(ces)
 		}
 	}
@@ -269,17 +284,37 @@ func (c *Controller) rateLimitProcessing() {
 	}
 }
 
-func (c *Controller) processNextWorkItem() bool {
-	c.rateLimitProcessing()
-	queue := c.fastQueue
+func (c *Controller) getQueue() workqueue.RateLimitingInterface {
+	var queue workqueue.RateLimitingInterface
+	c.cond.L.Lock()
+	defer c.cond.L.Unlock()
+	c.logger.Infof("Standard queue length: %d, fast queue length: %d", c.standardQueue.Len(), c.fastQueue.Len())
+	if c.fastQueue.Len() == 0 && c.standardQueue.Len() == 0 {
+		c.logger.Infof("empty queues")
+		c.cond.Wait()
+		c.logger.Infof("End of waiting")
+	}
+
 	if c.fastQueue.Len() == 0 {
 		queue = c.standardQueue
+		c.logger.Infof("Return standard queue")
+	} else {
+		queue = c.fastQueue
+		c.logger.Infof("Return fast queue")
 	}
+	return queue
+}
+
+func (c *Controller) processNextWorkItem() bool {
+	c.rateLimitProcessing()
+	queue := c.getQueue()
 	cKey, quit := queue.Get()
 	if quit {
 		return false
 	}
 	key := cKey.(CESName)
+	defer queue.Done(key)
+
 	c.logger.WithFields(logrus.Fields{
 		logfields.CESName: key.string(),
 	}).Debug("Processing CES")
@@ -306,7 +341,10 @@ func (c *Controller) handleErr(queue workqueue.RateLimitingInterface, err error,
 	}
 
 	if queue.NumRequeues(key) < maxRetries {
-		queue.AddRateLimited(key)
+		time.AfterFunc(c.rateLimiter.When(key), func() {
+			queue.Add(key)
+			c.cond.Signal()
+		})
 		return
 	}
 
